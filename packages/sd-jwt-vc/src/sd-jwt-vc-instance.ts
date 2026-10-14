@@ -1,4 +1,4 @@
-import { isMediaType, secondsToDate } from '@owf/identity-common'
+import { base64, isMediaType, secondsToDate } from '@owf/identity-common'
 import {
   getListFromStatusListJWT,
   MediaTypes,
@@ -40,6 +40,9 @@ import {
   TypeMetadataFormatSchema,
 } from './sd-jwt-vc-type-metadata-format'
 import type { VerificationResult } from './verification-result'
+
+// SRI hash algorithms, ordered from weakest to strongest
+const SRI_ALGORITHMS = ['sha256', 'sha384', 'sha512']
 
 export class SDJwtVcInstance<T = unknown> extends SDJwtInstance<SdJwtVcPayload, T> {
   /**
@@ -274,19 +277,29 @@ export class SDJwtVcInstance<T = unknown> extends SDJwtInstance<SdJwtVcPayload, 
     if (!integrity) return
 
     // validate the integrity of the response according to https://www.w3.org/TR/SRI/
-    const arrayBuffer = await response.arrayBuffer()
-    const alg = integrity.split('-')[0]
-    //TODO: error handling when a hasher is passed that is not supporting the required algorithm according to the spec
+    // only the strongest algorithm in the metadata is checked, any of its values may match
+    const entries = integrity
+      .split(/\s+/)
+      .map((entry) => {
+        const [alg, value] = entry.split('?')[0].split(/-(.*)/s)
+        return { alg, value }
+      })
+      .filter((entry) => SRI_ALGORITHMS.includes(entry.alg) && entry.value)
+    if (entries.length === 0) {
+      throw new SDJWTException(`Integrity check for ${url} failed: no supported algorithm in ${integrity}`)
+    }
+    const alg = entries.reduce((strongest, entry) =>
+      SRI_ALGORITHMS.indexOf(entry.alg) > SRI_ALGORITHMS.indexOf(strongest.alg) ? entry : strongest
+    ).alg
+    const expected = entries.filter((entry) => entry.alg === alg).map((entry) => entry.value)
+
     if (!this.userConfig.hasher) {
       throw new SDJWTException('Hasher not found')
     }
-    const hashBuffer = await this.userConfig.hasher(arrayBuffer, alg)
-    const integrityHash = integrity.split('-')[1]
-    const hash = Array.from(new Uint8Array(hashBuffer))
-      .map((byte) => byte.toString(16).padStart(2, '0'))
-      .join('')
-    if (hash !== integrityHash) {
-      throw new Error(`Integrity check for ${url} failed: is ${hash}, but expected ${integrityHash}`)
+    const arrayBuffer = await response.arrayBuffer()
+    const hash = base64.encode(await this.userConfig.hasher(arrayBuffer, alg))
+    if (!expected.includes(hash)) {
+      throw new Error(`Integrity check for ${url} failed: is ${hash}, but expected ${expected.join(' or ')}`)
     }
   }
 

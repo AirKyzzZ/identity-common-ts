@@ -1,5 +1,5 @@
 import Crypto from 'node:crypto'
-import { hasher as digest, generateSalt } from '@owf/crypto'
+import { hasher as digest, generateSalt, integrity } from '@owf/crypto'
 import type { DisclosureFrame, Signer, Verifier } from '@sd-jwt/core'
 import { HttpResponse, http } from 'msw'
 import { setupServer } from 'msw/node'
@@ -204,8 +204,7 @@ const restHandlers = [
   }),
 ]
 
-//this value could be generated on demand to make it easier when changing the values
-const vctIntegrity = 'sha256-e8bf419e6b860595f385611fc6172f1e95c18de3c80eef57c865f49e03747637'
+const vctIntegrity = integrity(JSON.stringify(exampleVctm))
 
 const server = setupServer(...restHandlers)
 
@@ -273,6 +272,55 @@ describe('App', () => {
 
     // Ensure validateIntegrity method was called
     expect(validateIntegritySpy).toHaveBeenCalledWith(expect.any(Response), vct, vctIntegrity)
+  })
+
+  describe('VCT integrity', () => {
+    const issueWithIntegrity = (vctIntegrity: string) => {
+      const payload: SdJwtVcPayload = { iat, iss, vct, 'vct#integrity': vctIntegrity, ...claims }
+      return sdjwt.issue(payload, disclosureFrame as unknown as DisclosureFrame<SdJwtVcPayload>)
+    }
+    const body = JSON.stringify(exampleVctm)
+    const wrongSha256 = integrity('other', 'sha256')
+
+    test('accepts a base64 encoded digest', async () => {
+      const result = await sdjwt.verify(await issueWithIntegrity(integrity(body, 'sha256')))
+      expect(result.typeMetadata?.mergedTypeMetadata.vct).toBe(vct)
+    })
+
+    test('rejects a digest that does not match', async () => {
+      await expect(sdjwt.verify(await issueWithIntegrity(wrongSha256))).rejects.toThrowError(
+        `Integrity check for ${vct} failed`
+      )
+    })
+
+    test('rejects the hex encoded digest', async () => {
+      const hex = Array.from(digest(body, 'sha256'), (byte) => byte.toString(16).padStart(2, '0')).join('')
+      await expect(sdjwt.verify(await issueWithIntegrity(`sha256-${hex}`))).rejects.toThrowError(
+        `Integrity check for ${vct} failed`
+      )
+    })
+
+    test('only checks the strongest algorithm', async () => {
+      await expect(
+        sdjwt.verify(await issueWithIntegrity(`${wrongSha256} ${integrity(body, 'sha512')}`))
+      ).resolves.toBeDefined()
+      await expect(
+        sdjwt.verify(await issueWithIntegrity(`${integrity(body, 'sha256')} ${integrity('other', 'sha384')}`))
+      ).rejects.toThrowError(`Integrity check for ${vct} failed`)
+    })
+
+    test('accepts any value of the strongest algorithm and ignores options', async () => {
+      const result = await sdjwt.verify(
+        await issueWithIntegrity(`${integrity('other', 'sha384')} ${integrity(body, 'sha384')}?foo=bar`)
+      )
+      expect(result.typeMetadata).toBeDefined()
+    })
+
+    test('rejects integrity metadata without a supported algorithm', async () => {
+      await expect(sdjwt.verify(await issueWithIntegrity('md5-abc'))).rejects.toThrowError(
+        `Integrity check for ${vct} failed: no supported algorithm in md5-abc`
+      )
+    })
   })
 
   test('VCT Validation with timeout', async () => {
