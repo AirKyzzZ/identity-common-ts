@@ -1,7 +1,8 @@
 import {
   CoseInvalidSignatureError,
+  CoseX5ChainNotBoundError,
+  getIntegrityProtectedX5Chain,
   RegisteredCwtClaimKey,
-  RegisteredCwtHeaderClaimKey,
   type SignatureAlgorithm,
 } from '@owf/cose'
 import { fetchStatusList, SLException, StatusListCwt, type StatusListInfo } from '@owf/token-status-list'
@@ -16,6 +17,7 @@ import {
   TrustedRevocationCertificatesMustContainAtleastOneCertificateError,
   UnableToExtractX5ChainFromCwtError,
   UnableToExtractX5ChainFromIdentifierListError,
+  UnprotectedX5ChainNotBoundError,
 } from '../errors'
 import { IdentifierListCwt } from './identifier-list-cwt'
 import type { IdentifierListInfo } from './identifier-list-info'
@@ -25,15 +27,16 @@ import type { IdentifierListInfo } from './identifier-list-info'
  * errors they raise into the mdoc error hierarchy so that a caller of `IssuerAuth.verify` only ever
  * has to know `MdlError`.
  */
-async function asMdlRevocationListError(
-  verification: () => Promise<unknown> | unknown,
+async function asMdlRevocationListError<T>(
+  verification: () => Promise<T> | T,
   /** The error to report a failed signature as. */
   invalidSignatureError: new (message: string) => MdlError
-): Promise<void> {
+): Promise<T> {
   try {
-    await verification()
+    return await verification()
   } catch (error) {
     if (error instanceof CoseInvalidSignatureError) throw new invalidSignatureError(error.message)
+    if (error instanceof CoseX5ChainNotBoundError) throw new UnprotectedX5ChainNotBoundError(error.message)
     if (error instanceof SLException) throw new InvalidRevocationListError(error.message)
     throw error
   }
@@ -64,7 +67,8 @@ function assertTrustedCertificates({
  *
  * § 12.3.6.3 requires the chain to travel in the protected header of the CWT: "The CWT shall
  * contain the x5chain in the protected header that contains the certificate or chain of
- * certificates used to verify the signature".
+ * certificates used to verify the signature". A status list may instead carry it in the
+ * unprotected header when a protected `x5t` binds its leaf, as RFC 9360 allows.
  */
 async function verifyRevocationListSigner(
   {
@@ -133,6 +137,9 @@ export type VerifyStatusListTokenResult = {
  *
  * § 12.3.6.3 requires the list to be a Status List Token "in CWT format, since the IssuerAuth
  * structure is a CWT", so a list served as a JWT is rejected rather than verified.
+ *
+ * The signer chain is read from the protected header, as § 12.3.6.3 requires, or else from the
+ * unprotected header when a protected `x5t` matches its leaf (RFC 9360).
  */
 export async function verifyStatusListToken(
   {
@@ -143,7 +150,7 @@ export async function verifyStatusListToken(
     skewSeconds,
     checkFreshness,
   }: VerifyStatusListTokenOptions,
-  ctx: Pick<MdocContext, 'fetch' | 'x509' | 'cose'>
+  ctx: Pick<MdocContext, 'fetch' | 'x509' | 'cose' | 'crypto'>
 ): Promise<VerifyStatusListTokenResult> {
   if (!disableCertificateChainValidation) assertTrustedCertificates({ trustedCertificates })
 
@@ -160,7 +167,12 @@ export async function verifyStatusListToken(
 
   const statusListCwt = StatusListCwt.fromToken(token)
 
-  const x5chain = normalizeX5Chain(statusListCwt.protectedHeaders.headers.get(RegisteredCwtHeaderClaimKey.X5Chain))
+  // NOTE: an unprotected x5chain is NOT allowed by § 12.3.6.3, but RFC 9360 allows it when a
+  // protected x5t binds the leaf. So it is accepted with that binding.
+  const x5chain = await asMdlRevocationListError(
+    () => getIntegrityProtectedX5Chain(statusListCwt, ctx.crypto),
+    InvalidSignatureError
+  )
   if (!x5chain) {
     throw new UnableToExtractX5ChainFromCwtError()
   }
@@ -274,11 +286,4 @@ export async function verifyIdentifierListToken(
   )
 
   return { identifierListCwt, chain }
-}
-
-/** COSE_X509 carries either a single certificate or a chain of them (RFC 9360). */
-function normalizeX5Chain(x5chain: unknown): Array<Uint8Array> | undefined {
-  const chain = x5chain instanceof Uint8Array ? [x5chain] : x5chain
-  if (!Array.isArray(chain) || chain.length === 0 || !chain.every((c) => c instanceof Uint8Array)) return undefined
-  return chain
 }
