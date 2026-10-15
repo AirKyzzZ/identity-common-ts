@@ -101,6 +101,7 @@ export const mdocContext: MdocContext = {
     verifyCertificateChain: async (input) => {
       const { trustedCertificates, x5chain: certificateChain } = input
       if (certificateChain.length === 0) throw new Error('Certificate chain is empty')
+      const now = input.now ?? new Date()
 
       const parsedLeafCertificate = new x509.X509Certificate(certificateChain[0] as Uint8Array<ArrayBuffer>)
       const certificatesToBuildChain = [...certificateChain, ...(trustedCertificates ?? [])].map(
@@ -173,10 +174,19 @@ export const mdocContext: MdocContext = {
         //   )
         // }
 
-        if (!skipSignatureVerification) {
-          await cert.verify({
-            publicKey,
-          })
+        // This example checks only each certificate's signature and validity period. A production implementation
+        // should use full certificate path validation (RFC 5280, section 6), including revocation (CRL or OCSP),
+        // basicConstraints and path length, key usage, and the rejection of unrecognised critical extensions.
+        if (!skipSignatureVerification && !(await cert.verify({ publicKey, signatureOnly: true }))) {
+          throw new Error(`The signature of certificate '${cert.subject}' is invalid`)
+        }
+
+        // RFC 5280, section 4.1.2.5: the validity period runs from notBefore through notAfter, inclusive.
+        // This also applies when the signature verification is skipped. Written so an invalid date fails.
+        if (!(now >= cert.notBefore && now <= cert.notAfter)) {
+          throw new Error(
+            `Certificate '${cert.subject}' is not valid at ${now.toUTCString()}; its validity period is ${cert.notBefore.toUTCString()} to ${cert.notAfter.toUTCString()}`
+          )
         }
         previousCertificate = cert
       }
