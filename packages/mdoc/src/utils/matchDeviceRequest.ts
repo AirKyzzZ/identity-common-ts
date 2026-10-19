@@ -1,5 +1,8 @@
+import { hexEncode } from '@owf/identity-common'
+import { parseCertificate } from '@owf/x509'
 import type { VerificationCallback } from '../mdoc/check-callback'
 import { InvalidDeviceRequestMatchOptionsError } from '../mdoc/errors'
+import type { AlternativeDataElementsSet } from '../mdoc/models/alternative-data-elements-set'
 import type { DataElementIdentifier } from '../mdoc/models/data-element-identifier'
 import type { DataElementValue } from '../mdoc/models/data-element-value'
 import type { DeviceNamespaces } from '../mdoc/models/device-namespaces'
@@ -11,7 +14,12 @@ import { IssuerSigned } from '../mdoc/models/issuer-signed'
 import type { IssuerSignedItem } from '../mdoc/models/issuer-signed-item'
 import type { KeyAuthorizations } from '../mdoc/models/key-authorizations'
 import type { Namespace } from '../mdoc/models/namespace'
-import { describeAgeOverLimitViolations, findAgeOverCandidate, findAgeOverRequestLimitViolations } from './ageOver'
+import {
+  describeAgeOverLimitViolations,
+  findAgeOverCandidate,
+  findAgeOverLimitViolations,
+  findAgeOverRequestLimitViolations,
+} from './ageOver'
 import { getOwnProperty } from './getOwnProperty'
 import { isDeviceSignedElementAuthorized } from './keyAuthorizations'
 
@@ -79,13 +87,15 @@ export type DeviceRequestMatchOptions = {
   docRequests?: Array<DocRequestMatchOptions>
 
   /**
-   * A device request with more than one doc request does not say whether it asks for all of them, or
-   * for any one of them. By default every doc request has to be satisfied. Set this to treat them as
-   * alternatives instead, of which at least one has to be satisfied, which is a common
-   * interpretation. The second edition of 18013-5 resolves the ambiguity with use cases in
-   * `DeviceRequestInfo`, which are not supported yet.
+   * A device request with more than one doc request and no use cases does not say whether it asks
+   * for all of them, or for any one of them. ISO/IEC TS 23220-4 7.2.1.3.2 reads it as all of them,
+   * which is the default: a single mandatory use case whose document set holds every doc request.
+   * Set this to treat them as alternatives instead, one optional use case per doc request, of which
+   * at least one has to be satisfied. That is how the iOS DC API presents such a request.
    *
-   * Does not apply to a device request with a single doc request. Defaults to `false`.
+   * A device request that carries use cases (ISO/IEC TS 23220-4 7.2.1.3.4, taken up by the second
+   * edition of 18013-5) is matched by them, and this option does not apply. Neither does it to a
+   * device request with a single doc request. Defaults to `false`.
    */
   treatAmbiguousMultipleDocRequestsAsAlternatives?: boolean
 }
@@ -114,6 +124,31 @@ export type ClaimMatchSuccess = ClaimMatchBase & {
   disclosedElementIdentifier: DataElementIdentifier
   elementValue: DataElementValue
   source: DisclosedElementSource
+  /**
+   * Set when the doc request has alternatives for the element (ISO/IEC TS 23220-4 7.2.1.3.2): every
+   * way it can be answered, in order of preference. The element itself comes first when it is
+   * there, then each alternative set whose elements all are, in the reader's order, possibly in other
+   * namespaces (18013-5 second edition 10.2.4).
+   *
+   * `disclosedElementIdentifier`, `elementValue` and `source` describe the first element of the first
+   * option. That option is an alternative set (it has an `alternativeElementSetIndex`) only when the
+   * element itself is not there. A holder discloses an alternative set by choosing it with the
+   * `alternatives` of the document it creates, and otherwise the element itself.
+   */
+  options?: NonEmptyArray<ClaimMatchOption>
+}
+
+/**
+ * One way to answer a requested element that has alternatives (ISO/IEC TS 23220-4 7.2.1.3.2): the
+ * element itself, or every element of one of its alternative sets (18013-5 second edition 10.2.4).
+ */
+export type ClaimMatchOption = {
+  /**
+   * Index into the `alternativeElementSets` of the element, when the option is one of them rather
+   * than the element itself.
+   */
+  alternativeElementSetIndex?: number
+  elements: NonEmptyArray<DisclosedElement>
 }
 
 export type ClaimMatchFailure = ClaimMatchBase & {
@@ -162,6 +197,17 @@ export type DocTypeMatchFailure = {
  * Whether a document or credential has the docType the doc request asks for.
  */
 export type DocTypeMatchResult = DocTypeMatchSuccess | DocTypeMatchFailure
+
+export type IssuerMatchSuccess = { success: true }
+export type IssuerMatchFailure = { success: false; reason: string }
+
+/**
+ * Whether a document or credential comes from an issuer the doc request accepts: a certificate in
+ * its certificate chain has one of the `issuerIdentifiers` of the `requestInfo` of the doc request
+ * as its authority key identifier (ISO/IEC TS 23220-4 7.2.1.3.2, 18013-5 second edition 10.2.4).
+ * Only present when the doc request names issuers.
+ */
+export type IssuerMatchResult = IssuerMatchSuccess | IssuerMatchFailure
 
 /**
  * Every requested element that is not optional is disclosed.
@@ -217,12 +263,14 @@ type DocumentMatchBase = {
 export type DocumentMatchSuccess = DocumentMatchBase & {
   success: true
   docType: DocTypeMatchSuccess
+  issuer?: IssuerMatchSuccess
   claims: DocumentClaimsMatchSuccess
 }
 
 export type DocumentMatchFailure = DocumentMatchBase & {
   success: false
   docType: DocTypeMatchResult
+  issuer?: IssuerMatchResult
   claims: DocumentClaimsMatchResult
 }
 
@@ -256,22 +304,74 @@ export type DocRequestMatchSuccess = DocRequestMatchBase & {
 
 export type DocRequestMatchFailure = DocRequestMatchBase & {
   success: false
-  validDocuments: []
+  /**
+   * Empty, unless the doc request requires a unique document set that the response does not give,
+   * see `reason`.
+   */
+  validDocuments: Array<DocumentMatchSuccess>
+  /**
+   * Set when the `requestInfo` of the doc request sets `uniqueDocSetRequired` (ISO/IEC TS 23220-4
+   * 7.2.1.3.2), and more documents satisfy it than one, plus one for each other doc request of its
+   * docType. A response does not say which document answers which doc request, and a document that
+   * satisfies this one may answer another of the same docType with elements left out.
+   */
+  reason?: string
 }
 
 export type DocRequestMatch = DocRequestMatchSuccess | DocRequestMatchFailure
 
-type DocRequestsAsAlternatives = {
+/**
+ * How a use case is satisfied.
+ */
+export type UseCaseMatch = {
   /**
-   * Whether the doc requests were matched as alternatives, of which at least one has to be
-   * satisfied, rather than all of them. Only `true` when
-   * `treatAmbiguousMultipleDocRequestsAsAlternatives` is set and the device request has more than
-   * one doc request.
+   * Index into `useCases` of the use case this result is about, which for use cases of the device
+   * request is also their index into `deviceRequestInfo.useCases`.
    */
-  docRequestsAsAlternatives: boolean
+  useCaseIndex: number
+  mandatory: boolean
+  /**
+   * The purpose hints of the use case, to tell the user what each use case is for (18013-5 second
+   * edition 10.2.5). Only use cases of the `deviceRequestInfo` have them.
+   */
+  purposeHints?: Map<string, number>
+  success: boolean
+  /**
+   * Every document set of the use case, in request order: the doc requests, by index, that answer
+   * it together.
+   */
+  documentSets: Array<Array<number>>
+  /**
+   * The document sets of `documentSets` whose doc requests are all satisfied, in request order.
+   * Empty when none is. A holder answers exactly one of them (ISO/IEC TS 23220-4 7.2.1.4).
+   */
+  matchingDocumentSets: Array<Array<number>>
 }
 
-type DeviceRequestMatchBase = DocRequestsAsAlternatives & {
+/**
+ * Where the use cases of a match come from.
+ *
+ * `'deviceRequestInfo'`: the use cases of the `deviceRequestInfo` of the device request (ISO/IEC TS
+ * 23220-4 7.2.1.3.4).
+ *
+ * `'allDocRequests'`: the device request carries none, so every doc request is requested (7.2.1.3.2):
+ * a single mandatory use case, whose one document set holds every doc request.
+ *
+ * `'eachDocRequest'`: the device request carries none, and
+ * `treatAmbiguousMultipleDocRequestsAsAlternatives` is set: one optional use case per doc request.
+ */
+export type UseCasesSource = 'deviceRequestInfo' | 'allDocRequests' | 'eachDocRequest'
+
+export type UseCasesMatch = {
+  useCasesSource: UseCasesSource
+  /**
+   * One entry per use case, in order. The match succeeds when every mandatory use case is satisfied
+   * and at least one use case is (18013-5 second edition 10.2.5).
+   */
+  useCases: Array<UseCaseMatch>
+}
+
+type DeviceRequestMatchBase = UseCasesMatch & {
   /**
    * Documents in the response whose docType no doc request asked for.
    */
@@ -279,23 +379,23 @@ type DeviceRequestMatchBase = DocRequestsAsAlternatives & {
 }
 
 /**
- * Every doc request is satisfied or, when matched as alternatives, at least one of them.
+ * Every mandatory use case is satisfied, and at least one use case is.
  */
 export type DeviceRequestMatchSuccess = DeviceRequestMatchBase &
   (
     | {
         success: true
-        docRequestsAsAlternatives: false
+        useCasesSource: 'allDocRequests'
         /**
-         * One entry per doc request, in request order.
+         * One entry per doc request, in request order. All of them are successful.
          */
         docRequests: Array<DocRequestMatchSuccess>
       }
     | {
         success: true
-        docRequestsAsAlternatives: true
+        useCasesSource: 'deviceRequestInfo' | 'eachDocRequest'
         /**
-         * One entry per doc request, in request order. At least one is successful.
+         * One entry per doc request, in request order.
          */
         docRequests: Array<DocRequestMatch>
       }
@@ -321,12 +421,14 @@ type CredentialMatchBase = {
 export type CredentialMatchSuccess = CredentialMatchBase & {
   success: true
   docType: DocTypeMatchSuccess
+  issuer?: IssuerMatchSuccess
   claims: ClaimsMatchSuccess
 }
 
 export type CredentialMatchFailure = CredentialMatchBase & {
   success: false
   docType: DocTypeMatchResult
+  issuer?: IssuerMatchResult
   claims: ClaimsMatchResult
 }
 
@@ -383,27 +485,29 @@ export type HolderDocRequestMatchFailure = HolderDocRequestMatchBase & {
 export type HolderDocRequestMatch = HolderDocRequestMatchSuccess | HolderDocRequestMatchFailure
 
 /**
- * Every doc request can be answered or, when matched as alternatives, at least one of them.
+ * Every mandatory use case can be satisfied, and at least one use case can.
  */
-export type HolderDeviceRequestMatchSuccess =
-  | {
-      success: true
-      docRequestsAsAlternatives: false
-      /**
-       * One entry per doc request, in request order.
-       */
-      docRequests: Array<HolderDocRequestMatchSuccess>
-    }
-  | {
-      success: true
-      docRequestsAsAlternatives: true
-      /**
-       * One entry per doc request, in request order. At least one is successful.
-       */
-      docRequests: Array<HolderDocRequestMatch>
-    }
+export type HolderDeviceRequestMatchSuccess = UseCasesMatch &
+  (
+    | {
+        success: true
+        useCasesSource: 'allDocRequests'
+        /**
+         * One entry per doc request, in request order. All of them are successful.
+         */
+        docRequests: Array<HolderDocRequestMatchSuccess>
+      }
+    | {
+        success: true
+        useCasesSource: 'deviceRequestInfo' | 'eachDocRequest'
+        /**
+         * One entry per doc request, in request order.
+         */
+        docRequests: Array<HolderDocRequestMatch>
+      }
+  )
 
-export type HolderDeviceRequestMatchFailure = DocRequestsAsAlternatives & {
+export type HolderDeviceRequestMatchFailure = UseCasesMatch & {
   success: false
   /**
    * One entry per doc request, in request order.
@@ -437,9 +541,16 @@ export type HolderCredential = {
  * are asserted by the mdoc itself rather than by the issuer. Pass `matchOptions` to mark elements
  * that are optional or that are expected to be device-signed.
  *
- * By default the match only succeeds when every doc request is satisfied. Set
- * `treatAmbiguousMultipleDocRequestsAsAlternatives` in `matchOptions` to have it succeed when at
- * least one is.
+ * The doc requests are matched by use case: those of the device request (ISO/IEC TS 23220-4
+ * 7.2.1.3.4) when it carries them, and otherwise every doc request as one mandatory use case, or each
+ * doc request as an optional one when `treatAmbiguousMultipleDocRequestsAsAlternatives` is set in
+ * `matchOptions`. The match succeeds when every mandatory use case is satisfied and at least one is.
+ *
+ * The `requestInfo` of a doc request is applied too: a document of an issuer it does not name
+ * fails, an alternative set it allows answers a requested element, and its elements count as
+ * requested rather than over-disclosed, and with
+ * `uniqueDocSetRequired` the doc request fails when more documents satisfy it than one, plus one for
+ * each other doc request of its docType, which they may answer instead.
  *
  * Shares its matching with {@link matchCredentialsToDeviceRequest}, which matches like a verifier
  * that accepts every element from `'any'` source.
@@ -452,6 +563,14 @@ export const matchDeviceRequest = (options: {
   deviceRequest: DeviceRequest
   deviceResponse: DeviceResponse
   matchOptions?: DeviceRequestMatchOptions
+  /**
+   * Per document, in response order, its certificate chain as validated against the trusted
+   * certificates, leaf first. The `issuerIdentifiers` of a doc request are matched against it, and
+   * a document without one does not satisfy a doc request that names issuers. The x5chain is not
+   * used: it is in the unprotected header of the IssuerAuth, so a holder can add the certificate of
+   * any issuer to it. `Verifier.verifyDeviceResponse` passes the chains it validates.
+   */
+  issuerCertificateChains?: Array<Array<Uint8Array> | undefined>
 }): DeviceRequestMatchResult => {
   const { deviceRequest, deviceResponse, matchOptions } = options
   const docRequestOptions = indexDocRequestOptions(deviceRequest, matchOptions)
@@ -462,8 +581,8 @@ export const matchDeviceRequest = (options: {
     mobileSecurityObject: document.issuerSigned.issuerAuth.mobileSecurityObject,
   }))
 
-  const docRequests = deviceRequest.docRequests.map((docRequest, docRequestIndex): DocRequestMatch => {
-    const { docType, namespaces } = docRequest.itemsRequest
+  const matches = deviceRequest.docRequests.map((docRequest, docRequestIndex) => {
+    const { docType, namespaces, requestInfo } = docRequest.itemsRequest
     const elements = docRequestOptions.get(docRequestIndex)?.elements
 
     const documentMatches = documents.map(({ document, mobileSecurityObject }, documentIndex): DocumentMatch => {
@@ -483,6 +602,12 @@ export const matchDeviceRequest = (options: {
               }
             : { success: true, docType }
 
+      const issuerResult = matchIssuer(
+        requestInfo?.issuerIdentifiers,
+        options.issuerCertificateChains?.[documentIndex],
+        'validated certificate chain'
+      )
+
       const { claims, unusedElements } = matchElements({
         mode: 'verifier',
         namespaces,
@@ -490,19 +615,57 @@ export const matchDeviceRequest = (options: {
         issuerSigned: document.issuerSigned,
         keyAuthorizations: mobileSecurityObject.deviceKeyInfo.keyAuthorizations,
         deviceNamespaces: document.deviceSigned.deviceNamespaces,
+        alternatives: requestInfo?.alternativeDataElements,
       })
       const claimsResult: DocumentClaimsMatchResult = {
         ...toClaimsMatchResult(claims),
         unrequestedClaims: unusedElements,
       }
 
-      return docTypeResult.success && claimsResult.success
-        ? { documentIndex, success: true, docType: docTypeResult, claims: claimsResult }
-        : { documentIndex, success: false, docType: docTypeResult, claims: claimsResult }
+      const issuer = issuerResult ? { issuer: issuerResult } : {}
+      return docTypeResult.success && claimsResult.success && issuerResult?.success !== false
+        ? {
+            documentIndex,
+            success: true,
+            docType: docTypeResult,
+            ...(issuer as { issuer?: IssuerMatchSuccess }),
+            claims: claimsResult,
+          }
+        : { documentIndex, success: false, docType: docTypeResult, ...issuer, claims: claimsResult }
     })
 
-    const validDocuments = documentMatches.filter((documentMatch) => documentMatch.success)
-    const failedDocuments = documentMatches.filter((documentMatch) => !documentMatch.success)
+    return {
+      docRequestIndex,
+      docType,
+      uniqueDocSetRequired: requestInfo?.uniqueDocSetRequired ?? false,
+      validDocuments: documentMatches.filter((documentMatch) => documentMatch.success),
+      failedDocuments: documentMatches.filter((documentMatch) => !documentMatch.success),
+    }
+  })
+
+  const docRequests = matches.map(({ uniqueDocSetRequired, ...match }): DocRequestMatch => {
+    const { docRequestIndex, docType, validDocuments, failedDocuments } = match
+
+    // A response does not say which document answers which doc request. A document that satisfies
+    // this doc request may answer another one of the same docType, possibly with elements left out,
+    // so only the documents that the other doc requests of its docType cannot account for count.
+    const otherDocRequests = matches.filter(
+      (other) => other.docRequestIndex !== docRequestIndex && other.docType === docType
+    ).length
+    if (uniqueDocSetRequired && validDocuments.length - otherDocRequests > 1) {
+      const documentIndexes = validDocuments.map((document) => document.documentIndex).join(', ')
+      return {
+        docRequestIndex,
+        docType,
+        success: false,
+        validDocuments,
+        failedDocuments,
+        reason:
+          otherDocRequests === 0
+            ? `Documents ${documentIndexes} satisfy doc request ${docRequestIndex}, but it requires a unique document set`
+            : `Documents ${documentIndexes} satisfy doc request ${docRequestIndex}, but it requires a unique document set, and the ${otherDocRequests} other doc request(s) of docType '${docType}' can take at most ${otherDocRequests} of them`,
+      }
+    }
 
     return isNonEmptyArray(validDocuments)
       ? { docRequestIndex, docType, success: true, validDocuments, failedDocuments }
@@ -514,15 +677,28 @@ export const matchDeviceRequest = (options: {
     requestedDocTypes.has(document.docType) ? [] : [{ documentIndex, docType: document.docType }]
   )
 
-  if (matchDocRequestsAsAlternatives(deviceRequest, matchOptions?.treatAmbiguousMultipleDocRequestsAsAlternatives)) {
-    return docRequests.some((docRequest) => docRequest.success)
-      ? { success: true, docRequestsAsAlternatives: true, docRequests, unrequestedDocuments }
-      : { success: false, docRequestsAsAlternatives: true, docRequests, unrequestedDocuments }
+  const useCases = matchUseCases(
+    resolveUseCases(deviceRequest, matchOptions?.treatAmbiguousMultipleDocRequestsAsAlternatives),
+    docRequests
+  )
+  if (!useCases.success) return { success: false, ...useCases.match, docRequests, unrequestedDocuments }
+  if (useCases.match.useCasesSource !== 'allDocRequests') {
+    return {
+      success: true,
+      useCasesSource: useCases.match.useCasesSource,
+      useCases: useCases.match.useCases,
+      docRequests,
+      unrequestedDocuments,
+    }
   }
-
-  return docRequests.every((docRequest) => docRequest.success)
-    ? { success: true, docRequestsAsAlternatives: false, docRequests, unrequestedDocuments }
-    : { success: false, docRequestsAsAlternatives: false, docRequests, unrequestedDocuments }
+  // A single use case holding every doc request is only satisfied when all of them are.
+  return {
+    success: true,
+    useCasesSource: 'allDocRequests',
+    useCases: useCases.match.useCases,
+    docRequests: docRequests.filter(isSuccess),
+    unrequestedDocuments,
+  }
 }
 
 /**
@@ -546,8 +722,13 @@ export const matchDeviceRequest = (options: {
  * A doc request that asks for more than two `age_over_NN` elements in a namespace (18013-5 7.2.5)
  * is not matched against any credential, and fails with `invalidDocRequest`.
  *
- * By default the match only succeeds when every doc request can be answered. Pass
- * `treatAmbiguousMultipleDocRequestsAsAlternatives` to have it succeed when at least one can.
+ * The doc requests are matched by use case, the same way as {@link matchDeviceRequest} does, and each
+ * use case lists the document sets the credentials can answer (`matchingDocumentSets`), of which
+ * the holder picks one.
+ *
+ * The `requestInfo` of a doc request is applied too: a credential of an issuer it does not name
+ * fails, and a requested element is answered by one of its alternative sets when the credential
+ * has one. The claims list every option, of which the holder can pick another than the first.
  *
  * Shares its matching with {@link matchDeviceRequest}: a credential matches like a verifier that
  * accepts every element from `'any'` source would match the response. A verifier only accepts
@@ -573,7 +754,7 @@ export const matchCredentialsToDeviceRequest = (options: {
   })
 
   const docRequests = deviceRequest.docRequests.map((docRequest, docRequestIndex): HolderDocRequestMatch => {
-    const { docType, namespaces } = docRequest.itemsRequest
+    const { docType, namespaces, requestInfo } = docRequest.itemsRequest
 
     const ageOverLimitViolations = findAgeOverRequestLimitViolations(namespaces)
     if (ageOverLimitViolations.length > 0) {
@@ -602,6 +783,12 @@ export const matchCredentialsToDeviceRequest = (options: {
                 reason: `Credential has docType '${credentialDocType}', but docType '${docType}' was requested`,
               }
 
+        const issuerResult = matchIssuer(
+          requestInfo?.issuerIdentifiers,
+          issuerAuthCertificateChain(issuerSigned),
+          'x5chain of the IssuerAuth'
+        )
+
         const claimsResult = toClaimsMatchResult(
           matchElements({
             mode: 'holder',
@@ -609,12 +796,20 @@ export const matchCredentialsToDeviceRequest = (options: {
             issuerSigned,
             keyAuthorizations: mobileSecurityObject.deviceKeyInfo.keyAuthorizations,
             deviceNamespaces,
+            alternatives: requestInfo?.alternativeDataElements,
           }).claims
         )
 
-        return docTypeResult.success && claimsResult.success
-          ? { credentialIndex, success: true, docType: docTypeResult, claims: claimsResult }
-          : { credentialIndex, success: false, docType: docTypeResult, claims: claimsResult }
+        const issuer = issuerResult ? { issuer: issuerResult } : {}
+        return docTypeResult.success && claimsResult.success && issuerResult?.success !== false
+          ? {
+              credentialIndex,
+              success: true,
+              docType: docTypeResult,
+              ...(issuer as { issuer?: IssuerMatchSuccess }),
+              claims: claimsResult,
+            }
+          : { credentialIndex, success: false, docType: docTypeResult, ...issuer, claims: claimsResult }
       }
     )
 
@@ -626,25 +821,141 @@ export const matchCredentialsToDeviceRequest = (options: {
       : { docRequestIndex, docType, success: false, validCredentials: [], failedCredentials }
   })
 
-  if (matchDocRequestsAsAlternatives(deviceRequest, options.treatAmbiguousMultipleDocRequestsAsAlternatives)) {
-    return docRequests.some((docRequest) => docRequest.success)
-      ? { success: true, docRequestsAsAlternatives: true, docRequests }
-      : { success: false, docRequestsAsAlternatives: true, docRequests }
+  const useCases = matchUseCases(
+    resolveUseCases(deviceRequest, options.treatAmbiguousMultipleDocRequestsAsAlternatives),
+    docRequests
+  )
+  if (!useCases.success) return { success: false, ...useCases.match, docRequests }
+  if (useCases.match.useCasesSource !== 'allDocRequests') {
+    return {
+      success: true,
+      useCasesSource: useCases.match.useCasesSource,
+      useCases: useCases.match.useCases,
+      docRequests,
+    }
   }
+  // A single use case holding every doc request is only satisfied when all of them are.
+  return {
+    success: true,
+    useCasesSource: 'allDocRequests',
+    useCases: useCases.match.useCases,
+    docRequests: docRequests.filter(isSuccess),
+  }
+}
 
-  return docRequests.every((docRequest) => docRequest.success)
-    ? { success: true, docRequestsAsAlternatives: false, docRequests }
-    : { success: false, docRequestsAsAlternatives: false, docRequests }
+type ResolvedUseCases = {
+  useCasesSource: UseCasesSource
+  useCases: Array<{ mandatory: boolean; purposeHints?: Map<string, number>; documentSets: Array<Array<number>> }>
 }
 
 /**
- * Whether the doc requests are matched as alternatives. A single doc request is not ambiguous, so it
- * always has to be satisfied.
+ * The use cases to match the device request by: its own (ISO/IEC TS 23220-4 7.2.1.3.4), and
+ * otherwise every doc request as one mandatory use case (7.2.1.3.2), or with
+ * `treatAmbiguousMultipleDocRequestsAsAlternatives` each doc request as an optional use case. A
+ * single doc request is not ambiguous, so it always is a mandatory use case of its own.
  */
-const matchDocRequestsAsAlternatives = (
+const resolveUseCases = (
   deviceRequest: DeviceRequest,
   treatAmbiguousMultipleDocRequestsAsAlternatives = false
-) => treatAmbiguousMultipleDocRequestsAsAlternatives && deviceRequest.docRequests.length > 1
+): ResolvedUseCases => {
+  const useCases = deviceRequest.deviceRequestInfo?.useCases
+  if (useCases) {
+    return {
+      useCasesSource: 'deviceRequestInfo',
+      useCases: useCases.map(({ mandatory, purposeHints, documentSets }) => ({
+        mandatory,
+        ...(purposeHints ? { purposeHints } : {}),
+        documentSets,
+      })),
+    }
+  }
+
+  const docRequestIndexes = deviceRequest.docRequests.map((_, docRequestIndex) => docRequestIndex)
+  if (treatAmbiguousMultipleDocRequestsAsAlternatives && docRequestIndexes.length > 1) {
+    return {
+      useCasesSource: 'eachDocRequest',
+      useCases: docRequestIndexes.map((docRequestIndex) => ({ mandatory: false, documentSets: [[docRequestIndex]] })),
+    }
+  }
+
+  return { useCasesSource: 'allDocRequests', useCases: [{ mandatory: true, documentSets: [docRequestIndexes] }] }
+}
+
+/**
+ * Per use case the document sets whose doc requests are all satisfied, and whether the device
+ * request is: every mandatory use case and at least one use case has to be (18013-5 second edition
+ * 10.2.5).
+ */
+const matchUseCases = ({ useCasesSource, useCases }: ResolvedUseCases, docRequests: Array<{ success: boolean }>) => {
+  const matches = useCases.map(({ mandatory, purposeHints, documentSets }, useCaseIndex): UseCaseMatch => {
+    const satisfied = documentSets.filter((set) => set.every((index) => docRequests[index]?.success === true))
+    return {
+      useCaseIndex,
+      mandatory,
+      ...(purposeHints ? { purposeHints } : {}),
+      success: satisfied.length > 0,
+      documentSets,
+      matchingDocumentSets: satisfied,
+    }
+  })
+
+  return {
+    match: { useCasesSource, useCases: matches },
+    success:
+      matches.every((useCase) => !useCase.mandatory || useCase.success) && matches.some((useCase) => useCase.success),
+  }
+}
+
+/**
+ * Whether a document or credential comes from one of `issuerIdentifiers`; undefined when the doc
+ * request names no issuer. Matched against the authority key identifiers of `certificateChain`:
+ * for a verifier the chain it validated, as the x5chain is in the unprotected header of the
+ * IssuerAuth, and for a holder the x5chain of its own credential. Without a chain, it fails.
+ *
+ * @internal
+ */
+export const matchIssuer = (
+  issuerIdentifiers: Array<Uint8Array> | undefined,
+  certificateChain: Array<Uint8Array> | undefined,
+  chainName: 'validated certificate chain' | 'x5chain of the IssuerAuth'
+): IssuerMatchResult | undefined => {
+  if (!issuerIdentifiers) return undefined
+
+  const accepted = `the ${issuerIdentifiers.length} issuer identifier(s) the doc request accepts`
+  if (!certificateChain) {
+    return { success: false, reason: `The document has no ${chainName} to match ${accepted} against` }
+  }
+
+  const keyIdentifiers = certificateChain.flatMap((certificate) => {
+    try {
+      return parseCertificate(certificate).authorityKeyIdentifier ?? []
+    } catch {
+      // A certificate that does not parse has no key identifier to match.
+      return []
+    }
+  })
+
+  return issuerIdentifiers.some((identifier) => keyIdentifiers.includes(hexEncode(identifier)))
+    ? { success: true }
+    : {
+        success: false,
+        reason: `No certificate in the ${chainName} has one of ${accepted} as its authority key identifier`,
+      }
+}
+
+/**
+ * The x5chain of the IssuerAuth of a credential, which a holder matches issuers against; undefined
+ * when it cannot be read.
+ *
+ * @internal
+ */
+export const issuerAuthCertificateChain = (issuerSigned: IssuerSigned) => {
+  try {
+    return issuerSigned.issuerAuth.certificateChain
+  } catch {
+    return undefined
+  }
+}
 
 type ElementCandidate = DisclosedElement & {
   /**
@@ -659,9 +970,31 @@ type ElementCandidate = DisclosedElement & {
 export type ElementMatch =
   | {
       claim: ClaimMatchSuccess
+      /**
+       * The first element of the first option, see `claim.options`.
+       */
       element: ElementCandidate
+      /**
+       * Every option, as `claim.options` lists them, when the element has alternatives.
+       */
+      options?: NonEmptyArray<ElementOption>
     }
-  | { claim: ClaimMatchFailure; element?: undefined }
+  | { claim: ClaimMatchFailure; element?: undefined; options?: undefined }
+
+/**
+ * @internal
+ */
+export type ElementOption = { alternativeElementSetIndex?: number; elements: NonEmptyArray<ElementCandidate> }
+
+const toDisclosedElement = ({ issuerSignedItem: _, ...element }: ElementCandidate): DisclosedElement => element
+
+const groupByNamespace = (elements: Array<DisclosedElement>) => {
+  const namespaces = new Map<Namespace, Array<DataElementIdentifier>>()
+  for (const { namespace, elementIdentifier } of elements) {
+    namespaces.set(namespace, [...(namespaces.get(namespace) ?? []), elementIdentifier])
+  }
+  return namespaces
+}
 
 /**
  * Match the requested elements of a single doc request against a single document or credential.
@@ -690,24 +1023,122 @@ export const matchElements = (options: {
    */
   keyAuthorizations: KeyAuthorizations | undefined
   deviceNamespaces?: DeviceNamespaces
+  /**
+   * The alternative data elements of the `requestInfo` of the doc request (ISO/IEC TS 23220-4
+   * 7.2.1.3.2). Each alternative set whose elements all are there (18013-5 second edition 10.2.4),
+   * each found the way the requested element would be, is an option to answer the requested element,
+   * after the element itself. The first option answers it. For a holder, an alternative set that
+   * would make the response disclose more than two age_over_NN elements in a namespace is not an
+   * option.
+   */
+  alternatives?: Array<AlternativeDataElementsSet>
 }): { claims: Array<ElementMatch>; unusedElements: Array<DisclosedElement> } => {
   const { mode, namespaces, keyAuthorizations } = options
 
   const available = collectElements(options.issuerSigned, options.deviceNamespaces)
 
+  const inNamespace = (namespace: Namespace, source: DisclosedElementSource) =>
+    available.filter((element) => element.namespace === namespace && element.source === source)
+  const authorizedDeviceSigned = (namespace: Namespace) =>
+    inNamespace(namespace, 'deviceSigned').filter((element) =>
+      isDeviceSignedElementAuthorized(keyAuthorizations, element)
+    )
+
+  /**
+   * The element that answers a request for `elementIdentifier` in `namespace`: for a holder
+   * issuer-signed, else device-signed when authorized and given for exactly that element; for a
+   * verifier from the source its options allow. The same rules as for a requested element.
+   */
+  const lookup = (namespace: Namespace, elementIdentifier: DataElementIdentifier): ElementCandidate | undefined => {
+    if (mode === 'holder') {
+      return (
+        findElement(elementIdentifier, inNamespace(namespace, 'issuerSigned')) ??
+        authorizedDeviceSigned(namespace).find((candidate) => candidate.elementIdentifier === elementIdentifier)
+      )
+    }
+    const namespaceOptions = getOwnProperty(options.elements, namespace)
+    const { source = 'issuerSigned' } =
+      getOwnProperty(namespaceOptions, elementIdentifier) ?? getOwnProperty(namespaceOptions, '*') ?? {}
+    return source === 'deviceSigned'
+      ? findElement(elementIdentifier, authorizedDeviceSigned(namespace))
+      : (findElement(elementIdentifier, inNamespace(namespace, 'issuerSigned')) ??
+          (source === 'any' ? findElement(elementIdentifier, authorizedDeviceSigned(namespace)) : undefined))
+  }
+
+  /**
+   * Every alternative set of the requested element whose elements all are there, in the reader's
+   * order; undefined when the doc request has no alternatives for the element.
+   */
+  const findAlternatives = (namespace: Namespace, elementIdentifier: DataElementIdentifier) => {
+    const alternative = options.alternatives?.find(
+      ({ requestedElement: [requestedNamespace, requestedIdentifier] }) =>
+        requestedNamespace === namespace && requestedIdentifier === elementIdentifier
+    )
+    if (!alternative) return undefined
+
+    return alternative.alternativeElementSets.flatMap((set, alternativeElementSetIndex): Array<ElementOption> => {
+      const elements = set.map(([alternativeNamespace, alternativeIdentifier]) =>
+        lookup(alternativeNamespace, alternativeIdentifier)
+      )
+      return elements.every((element) => element !== undefined) && isNonEmptyArray(elements)
+        ? [{ alternativeElementSetIndex, elements }]
+        : []
+    })
+  }
+
+  /** The options to answer a requested element: itself when it is there, then its alternatives. */
+  const optionsFor = (
+    namespace: Namespace,
+    elementIdentifier: DataElementIdentifier,
+    element: ElementCandidate | undefined
+  ) => {
+    const alternatives = findAlternatives(namespace, elementIdentifier)
+    const elementOptions: Array<ElementOption> = [
+      ...(element ? [{ elements: [element] as NonEmptyArray<ElementCandidate> }] : []),
+      ...(alternatives ?? []),
+    ]
+    return {
+      options: isNonEmptyArray(elementOptions) ? elementOptions : undefined,
+      hasAlternatives: alternatives !== undefined,
+    }
+  }
+
   const claims: Array<ElementMatch> = []
   const usedElements = new Set<DisclosedElement>()
+  // Holder claims are only settled once every requested element is looked up, see below.
+  const holderClaims: Array<{
+    claim: ClaimMatchBase
+    element: ElementCandidate | undefined
+    elementOptions: Array<ElementOption> | undefined
+    hasAlternatives: boolean
+  }> = []
 
-  const success = (claim: ClaimMatchBase, element: ElementCandidate) => {
-    usedElements.add(element)
+  /**
+   * The claim is answered by the first option. `listOptions` is set when the element has
+   * alternatives, so that every option is reported.
+   */
+  const success = (claim: ClaimMatchBase, elementOptions: NonEmptyArray<ElementOption>, listOptions: boolean) => {
+    const [first] = elementOptions
+    for (const element of first.elements) usedElements.add(element)
+    const [element] = first.elements
+
     claims.push({
       element,
+      ...(listOptions ? { options: elementOptions } : {}),
       claim: {
         ...claim,
         success: true,
         disclosedElementIdentifier: element.elementIdentifier,
         elementValue: element.elementValue,
         source: element.source,
+        ...(listOptions
+          ? {
+              options: elementOptions.map(({ alternativeElementSetIndex, elements }) => ({
+                ...(alternativeElementSetIndex === undefined ? {} : { alternativeElementSetIndex }),
+                elements: elements.map(toDisclosedElement) as NonEmptyArray<DisclosedElement>,
+              })) as NonEmptyArray<ClaimMatchOption>,
+            }
+          : {}),
       },
     })
   }
@@ -743,17 +1174,8 @@ export const matchElements = (options: {
         const element =
           findElement(elementIdentifier, issuerSignedInNamespace) ??
           authorizedDeviceSignedInNamespace.find((candidate) => candidate.elementIdentifier === elementIdentifier)
-        if (element) {
-          success(claim, element)
-          continue
-        }
-
-        failure(claim, {
-          failure: 'notDisclosed',
-          reason: isDeviceSignedElementAuthorized(keyAuthorizations, { namespace, elementIdentifier })
-            ? `Element '${elementIdentifier}' in namespace '${namespace}' is not issuer-signed in the credential, so it has to be disclosed device-signed, but no value was provided for it in the device namespaces`
-            : `Element '${elementIdentifier}' in namespace '${namespace}' is not issuer-signed in the credential, and the device key is not authorized to sign it`,
-        })
+        const { options: elementOptions, hasAlternatives } = optionsFor(namespace, elementIdentifier, element)
+        holderClaims.push({ claim, element, elementOptions, hasAlternatives })
         continue
       }
 
@@ -769,8 +1191,11 @@ export const matchElements = (options: {
           : (findElement(elementIdentifier, issuerSignedInNamespace) ??
             (source === 'any' ? findElement(elementIdentifier, authorizedDeviceSignedInNamespace) : undefined))
 
-      if (element) {
-        success(claim, element)
+      // ISO/IEC TS 23220-4 7.2.1.3.2: an alternative set the request allows answers it too, when every
+      // element of it is there (18013-5 second edition 10.2.4).
+      const { options: elementOptions, hasAlternatives } = optionsFor(namespace, elementIdentifier, element)
+      if (elementOptions) {
+        success(claim, elementOptions, hasAlternatives)
         continue
       }
 
@@ -824,6 +1249,45 @@ export const matchElements = (options: {
         failure: 'notDisclosed',
         reason: `Element '${elementIdentifier}' in namespace '${namespace}' was not disclosed`,
       })
+    }
+  }
+
+  // 18013-5 7.2.5: at most two age_over_NN elements are disclosed per namespace. The requested
+  // elements the credential has are disclosed by default, so an alternative set is only offered when,
+  // disclosed with those of the other claims, it keeps every namespace within two.
+  for (const [claimIndex, { claim, element, elementOptions, hasAlternatives }] of holderClaims.entries()) {
+    const others = holderClaims.flatMap((other, otherIndex) =>
+      otherIndex !== claimIndex && other.element ? [other.element] : []
+    )
+    const options = elementOptions?.filter(
+      (option) =>
+        option.alternativeElementSetIndex === undefined ||
+        findAgeOverLimitViolations(groupByNamespace([...others, ...option.elements])).length === 0
+    )
+    if (options && isNonEmptyArray(options)) {
+      success(claim, options, hasAlternatives)
+      continue
+    }
+
+    const { namespace, elementIdentifier } = claim
+    failure(claim, {
+      failure: 'notDisclosed',
+      reason:
+        elementOptions && !element
+          ? `Element '${elementIdentifier}' in namespace '${namespace}' is not in the credential, and each of its alternative sets the credential has would disclose more than two age_over_NN elements in a namespace`
+          : isDeviceSignedElementAuthorized(keyAuthorizations, { namespace, elementIdentifier })
+            ? `Element '${elementIdentifier}' in namespace '${namespace}' is not issuer-signed in the credential, so it has to be disclosed device-signed, but no value was provided for it in the device namespaces`
+            : `Element '${elementIdentifier}' in namespace '${namespace}' is not issuer-signed in the credential, and the device key is not authorized to sign it`,
+    })
+  }
+
+  // An element of an alternative set of a requested element is requested too, whether or not it
+  // answers it, so disclosing it is not over-disclosure.
+  for (const { requestedElement, alternativeElementSets } of options.alternatives ?? []) {
+    if (!namespaces.get(requestedElement[0])?.has(requestedElement[1])) continue
+    for (const [alternativeNamespace, alternativeIdentifier] of alternativeElementSets.flat()) {
+      const element = lookup(alternativeNamespace, alternativeIdentifier)
+      if (element) usedElements.add(element)
     }
   }
 
@@ -893,6 +1357,8 @@ export const validateDeviceRequestMatchOptions = (
 
 const isNonEmptyArray = <T>(array: Array<T>): array is NonEmptyArray<T> => array.length > 0
 
+const isSuccess = <T extends { success: boolean }>(result: T): result is Extract<T, { success: true }> => result.success
+
 /**
  * The element that answers a request for `elementIdentifier`, either by identifier or, for an age
  * attestation, by the substitution 18013-5 7.2.5 allows.
@@ -936,15 +1402,51 @@ const collectElements = (issuerSigned: IssuerSigned, deviceNamespaces?: DeviceNa
  * A doc request that is not satisfied is a `FAILED` check; over-disclosure and documents that were
  * never requested are reported as `WARNING`, as they are the mdoc's doing and it is up to the
  * verifier whether to accept the response anyway. When the doc requests are matched as alternatives,
- * a single check is reported instead, which only fails when none of them is satisfied.
+ * a single check is reported instead, which only fails when none of them is satisfied, and when the
+ * device request carries use cases, one check per mandatory use case and one for "at least one".
  *
  * The match is attached to the doc request checks as their structured `result`, so that it survives
  * a callback that throws on a `FAILED` check instead of collecting them.
  */
 export const reportDeviceRequestMatch = (match: DeviceRequestMatchResult, onCheck: VerificationCallback) => {
   const result = { type: 'deviceRequestMatch', match } as const
+  const failureReasons = (docRequestIndexes: Array<number>) =>
+    match.docRequests
+      .filter((docRequest) => !docRequest.success && docRequestIndexes.includes(docRequest.docRequestIndex))
+      .map((docRequest) => `Doc request ${docRequest.docRequestIndex}: ${docRequestFailureReason(docRequest)}`)
+      .join('. ')
 
-  if (match.docRequestsAsAlternatives) {
+  if (match.useCasesSource === 'deviceRequestInfo') {
+    // A mandatory use case is a check of its own; an optional one only counts towards "at least one".
+    for (const useCase of match.useCases) {
+      if (!useCase.mandatory) continue
+      const check = `Device response must satisfy mandatory use case ${useCase.useCaseIndex}`
+      if (useCase.success) {
+        onCheck({ status: 'PASSED', check, category: 'DOCUMENT_FORMAT', result })
+      } else {
+        onCheck({
+          status: 'FAILED',
+          check,
+          category: 'DOCUMENT_FORMAT',
+          reason: `None of the document sets of use case ${useCase.useCaseIndex} has all its doc requests satisfied. ${failureReasons(useCase.documentSets.flat())}`,
+          result,
+        })
+      }
+    }
+
+    const check = 'Device response must satisfy at least one use case'
+    if (match.useCases.some((useCase) => useCase.success)) {
+      onCheck({ status: 'PASSED', check, category: 'DOCUMENT_FORMAT', result })
+    } else {
+      onCheck({
+        status: 'FAILED',
+        check,
+        category: 'DOCUMENT_FORMAT',
+        reason: `No use case is satisfied. ${failureReasons(match.useCases.flatMap((useCase) => useCase.documentSets.flat()))}`,
+        result,
+      })
+    }
+  } else if (match.useCasesSource === 'eachDocRequest') {
     const check = `Device response must satisfy at least one of the alternative doc requests ${match.docRequests
       .map((docRequest) => `${docRequest.docRequestIndex} for docType '${docRequest.docType}'`)
       .join(', ')}`
@@ -1047,6 +1549,8 @@ const findOverDisclosure = (match: DeviceRequestMatchResult) => {
 }
 
 const docRequestFailureReason = (docRequest: DocRequestMatch) => {
+  if (!docRequest.success && docRequest.reason) return docRequest.reason
+
   // Documents of another docType are not an attempt to answer this doc request.
   const documents = docRequest.failedDocuments.filter(
     (document) => document.docType.success || document.docType.docType === docRequest.docType
@@ -1061,7 +1565,11 @@ const docRequestFailureReason = (docRequest: DocRequestMatch) => {
       if (!document.docType.success) return `Document ${document.documentIndex}: ${document.docType.reason}`
 
       const failedClaims = document.claims.failedClaims.filter((claim) => !claim.optional)
-      return `Document ${document.documentIndex}: ${failedClaims.map((claim) => claim.reason).join('; ')}`
+      const reasons = [
+        ...(document.issuer && !document.issuer.success ? [document.issuer.reason] : []),
+        ...failedClaims.map((claim) => claim.reason),
+      ]
+      return `Document ${document.documentIndex}: ${reasons.join('; ')}`
     })
     .join('. ')
 }

@@ -21,8 +21,11 @@ import {
   type ClaimMatch,
   type DeviceRequestMatchOptions,
   type DeviceRequestMatchResult,
+  type ElementMatch,
+  issuerAuthCertificateChain,
   matchDeviceRequest,
   matchElements,
+  matchIssuer,
   reportDeviceRequestMatch,
   validateDeviceRequestMatchOptions,
 } from '../../utils/matchDeviceRequest'
@@ -35,6 +38,7 @@ import {
   EitherSignatureOrMacMustBeProvidedError,
   InvalidElementSelectionError,
   MissingRequestedElementError,
+  UnsatisfiedDeviceRequestError,
 } from '../errors'
 import type { DataElementIdentifier } from './data-element-identifier'
 import type { DataElementValue } from './data-element-value'
@@ -56,6 +60,12 @@ import type { IssuerSignedItem } from './issuer-signed-item'
 import type { KeyAuthorizations } from './key-authorizations'
 import type { Namespace } from './namespace'
 import type { SessionTranscript } from './session-transcript'
+
+/**
+ * Whether a requested element is answered by one of its alternative sets, which a holder only
+ * discloses when it chooses one: the credential does not have the element itself.
+ */
+const isAnsweredByAlternative = (match: ElementMatch) => match.options?.[0].alternativeElementSetIndex !== undefined
 
 const deviceResponseEncodedSchema = typedMap([
   ['version', z.string()],
@@ -116,10 +126,29 @@ export type DeviceResponseDocumentOptions = {
    */
   elements?: Record<Namespace, Array<DataElementIdentifier>>
   /**
+   * For a requested element that has alternatives in the `requestInfo` of the doc request (ISO/IEC
+   * TS 23220-4 7.2.1.3.2, 18013-5 second edition 10.2.4), the index into its `alternativeElementSets`
+   * of the set to disclose in its place, per namespace and element. Every element of the set is
+   * disclosed, possibly in other namespaces. The `options` of the claims of `Holder.matchDeviceRequest`
+   * list the sets the credential can disclose.
+   *
+   * An alternative set is only disclosed when it is chosen here, so that nothing is disclosed that
+   * the holder was not shown. By default the element itself is disclosed, and a requested element the
+   * credential does not have throws a `MissingRequestedElementError`, even when an alternative set
+   * could answer it.
+   *
+   * Throws an `InvalidElementSelectionError` for an element the doc request does not request, a set
+   * it does not have, an element that `elements` leaves out, or a set that discloses an element that
+   * `elements` leaves out; and a `MissingRequestedElementError` for a set the credential does not
+   * have every element of.
+   */
+  alternatives?: Record<Namespace, Record<DataElementIdentifier, number>>
+  /**
    * Values to disclose device-signed. Every selected requested element that is not issuer-signed,
    * but that the device key is authorized for in the MSO, has to be provided here. Only the values
-   * of selected requested elements are disclosed and authenticated, so a value that is not requested
-   * or that `elements` leaves out is not.
+   * of selected requested elements, and of the alternative sets chosen in `alternatives`, are
+   * disclosed and authenticated, so a value that is not requested or that `elements` leaves out is
+   * not.
    */
   deviceNamespaces?: DeviceNamespaces
   signature?: {
@@ -294,6 +323,8 @@ export class DeviceResponse extends CborStructure<DeviceResponseEncodedStructure
         deviceRequest: options.deviceRequest,
         deviceResponse: this,
         matchOptions: options.deviceRequestMatchOptions,
+        // The x5chain is not signed, so issuers are matched against the validated chains.
+        issuerCertificateChains: documentResults.map(({ trustedIssuanceChain }) => trustedIssuanceChain),
       })
       reportDeviceRequestMatch(deviceRequestMatch, onCheck)
     }
@@ -320,6 +351,7 @@ export class DeviceResponse extends CborStructure<DeviceResponseEncodedStructure
       sessionTranscript: SessionTranscript | Uint8Array
       issuerSigned: IssuerSigned
       elements?: Record<Namespace, Array<DataElementIdentifier>>
+      alternatives?: Record<Namespace, Record<DataElementIdentifier, number>>
       deviceNamespaces?: DeviceNamespaces
       signature?: {
         signingKey: CoseKey
@@ -361,6 +393,7 @@ export class DeviceResponse extends CborStructure<DeviceResponseEncodedStructure
       keyAuthorizations,
       deviceNamespaces: options.deviceNamespaces,
       elements: options.elements,
+      alternatives: options.alternatives,
     })
 
     // 18013-5 9.1.3.4 binds the mdoc as well as the mdoc reader. Selection only picks authorized
@@ -445,8 +478,9 @@ export class DeviceResponse extends CborStructure<DeviceResponseEncodedStructure
    * issuer-signed when the issuer signed it, and otherwise device-signed when the device key is
    * authorized for it and its value is in the device namespaces.
    *
-   * Only the selected requested elements are disclosed, from either source: a device-signed element
-   * that is not requested, or that `elements` leaves out, is not disclosed.
+   * Only the selected requested elements, or the alternative sets chosen for them, are disclosed,
+   * from either source: a device-signed element that is not requested, or that `elements` leaves
+   * out, is not disclosed.
    */
   private static selectElements(options: {
     docRequest: DocRequest
@@ -454,6 +488,7 @@ export class DeviceResponse extends CborStructure<DeviceResponseEncodedStructure
     keyAuthorizations: KeyAuthorizations | undefined
     deviceNamespaces?: DeviceNamespaces
     elements?: Record<Namespace, Array<DataElementIdentifier>>
+    alternatives?: Record<Namespace, Record<DataElementIdentifier, number>>
   }) {
     const { claims } = matchElements({
       mode: 'holder',
@@ -461,6 +496,7 @@ export class DeviceResponse extends CborStructure<DeviceResponseEncodedStructure
       issuerSigned: options.issuerSigned,
       keyAuthorizations: options.keyAuthorizations,
       deviceNamespaces: options.deviceNamespaces,
+      alternatives: options.docRequest.itemsRequest.requestInfo?.alternativeDataElements,
     })
 
     if (options.elements) {
@@ -478,9 +514,39 @@ export class DeviceResponse extends CborStructure<DeviceResponseEncodedStructure
     const isSelected = ({ namespace, elementIdentifier }: ClaimMatch) =>
       options.elements ? (getOwnProperty(options.elements, namespace)?.includes(elementIdentifier) ?? false) : true
 
-    // The element that answers each requested element left out of the selection, with that claim.
+    const requestedAlternatives = options.docRequest.itemsRequest.requestInfo?.alternativeDataElements
+    for (const [namespace, chosen] of Object.entries(options.alternatives ?? {})) {
+      for (const [elementIdentifier, alternativeElementSetIndex] of Object.entries(chosen)) {
+        if (!options.docRequest.itemsRequest.namespaces.get(namespace)?.has(elementIdentifier)) {
+          throw new InvalidElementSelectionError(
+            `Alternative set ${alternativeElementSetIndex} of element '${elementIdentifier}' in namespace '${namespace}' is selected for disclosure, but the doc request does not request the element`
+          )
+        }
+        const sets = requestedAlternatives?.find(
+          ({ requestedElement: [requestedNamespace, requestedIdentifier] }) =>
+            requestedNamespace === namespace && requestedIdentifier === elementIdentifier
+        )?.alternativeElementSets
+        if (!sets?.[alternativeElementSetIndex]) {
+          throw new InvalidElementSelectionError(
+            `Alternative set ${alternativeElementSetIndex} of element '${elementIdentifier}' in namespace '${namespace}' is selected for disclosure, but the doc request has no such alternative set`
+          )
+        }
+        if (options.elements && !getOwnProperty(options.elements, namespace)?.includes(elementIdentifier)) {
+          throw new InvalidElementSelectionError(
+            `Alternative set ${alternativeElementSetIndex} of element '${elementIdentifier}' in namespace '${namespace}' is selected for disclosure, but the element itself is not selected`
+          )
+        }
+      }
+    }
+
+    // The element of each requested element left out of the selection, with that claim. One that the
+    // credential does not have, and that an alternative set answers, has none to leave out.
     const declinedElements = new Map(
-      claims.flatMap(({ claim, element }) => (element && !isSelected(claim) ? [[element, claim] as const] : []))
+      claims.flatMap((match) =>
+        match.element && !isAnsweredByAlternative(match) && !isSelected(match.claim)
+          ? [[match.element, match.claim] as const]
+          : []
+      )
     )
 
     const issuerNamespaces = new Map<Namespace, Array<IssuerSignedItem>>()
@@ -492,27 +558,68 @@ export class DeviceResponse extends CborStructure<DeviceResponseEncodedStructure
       if (match.element === undefined) throw new MissingRequestedElementError(match.claim.reason)
       const { element } = match
 
-      // An age attestation can answer more than one `age_over_NN` request (18013-5 7.2.5).
-      // Disclosing it for this element would also answer a requested element that is left out, so
-      // leaving that one out would have no effect.
-      const declined = declinedElements.get(element)
-      if (declined) {
-        throw new InvalidElementSelectionError(
-          `Element '${claim.elementIdentifier}' in namespace '${claim.namespace}' is selected for disclosure, but it is answered with '${element.elementIdentifier}', which also answers '${declined.elementIdentifier}' that is not selected. Select both or neither`
+      const alternativeElementSetIndex = getOwnProperty(
+        getOwnProperty(options.alternatives, claim.namespace),
+        claim.elementIdentifier
+      )
+      const chosen =
+        alternativeElementSetIndex === undefined
+          ? undefined
+          : match.options?.find((option) => option.alternativeElementSetIndex === alternativeElementSetIndex)
+      if (alternativeElementSetIndex !== undefined && !chosen) {
+        throw new MissingRequestedElementError(
+          `Alternative set ${alternativeElementSetIndex} of element '${claim.elementIdentifier}' in namespace '${claim.namespace}' is selected for disclosure, but the credential cannot disclose every element of it`
         )
       }
 
-      if (!element.issuerSignedItem) {
-        const items = deviceNamespaces.get(element.namespace) ?? new Map()
-        items.set(element.elementIdentifier, element.elementValue)
-        deviceNamespaces.set(element.namespace, items)
-        continue
+      // An alternative set is only disclosed when the holder chooses it, so that nothing is disclosed
+      // that the holder was not shown: the requested element may be answered by elements in other
+      // namespaces, which the claim does not describe.
+      if (isAnsweredByAlternative(match) && !chosen) {
+        throw new MissingRequestedElementError(
+          `Element '${claim.elementIdentifier}' in namespace '${claim.namespace}' is not in the credential. Choose one of its alternative sets ${match.options?.map((option) => option.alternativeElementSetIndex).join(', ')} with \`alternatives\` to disclose in its place`
+        )
       }
 
-      const items = issuerNamespaces.get(claim.namespace) ?? []
-      // An age attestation can answer more than one `age_over_NN` request, but is disclosed once.
-      if (!items.includes(element.issuerSignedItem)) items.push(element.issuerSignedItem)
-      issuerNamespaces.set(claim.namespace, items)
+      // An alternative set (18013-5 second edition 10.2.4) is disclosed whole, each element in its
+      // own namespace, which need not be the requested element's.
+      const disclosedElements = chosen?.elements ?? [element]
+
+      // An element left out must not be disclosed for another requested element, neither as an age
+      // attestation that answers both (18013-5 7.2.5) nor in an alternative set, or leaving it out
+      // would have no effect.
+      for (const disclosed of disclosedElements) {
+        const declined = declinedElements.get(disclosed)
+        if (!declined) continue
+
+        const selected = `Element '${claim.elementIdentifier}' in namespace '${claim.namespace}' is selected for disclosure`
+        if (!chosen) {
+          throw new InvalidElementSelectionError(
+            `${selected}, but it is answered with '${disclosed.elementIdentifier}', which also answers '${declined.elementIdentifier}' that is not selected. Select both or neither`
+          )
+        }
+        const answer =
+          disclosed.namespace === declined.namespace && disclosed.elementIdentifier === declined.elementIdentifier
+            ? `'${disclosed.elementIdentifier}' in namespace '${disclosed.namespace}'`
+            : `'${disclosed.elementIdentifier}' in namespace '${disclosed.namespace}', which answers '${declined.elementIdentifier}' in namespace '${declined.namespace}'`
+        throw new InvalidElementSelectionError(
+          `${selected}, but it is answered with alternative set ${chosen.alternativeElementSetIndex}, which discloses ${answer} that is not selected. Select both, or choose another alternative set`
+        )
+      }
+
+      for (const disclosed of disclosedElements) {
+        if (!disclosed.issuerSignedItem) {
+          const items = deviceNamespaces.get(disclosed.namespace) ?? new Map()
+          items.set(disclosed.elementIdentifier, disclosed.elementValue)
+          deviceNamespaces.set(disclosed.namespace, items)
+          continue
+        }
+
+        const items = issuerNamespaces.get(disclosed.namespace) ?? []
+        // An age attestation can answer more than one `age_over_NN` request, but is disclosed once.
+        if (!items.includes(disclosed.issuerSignedItem)) items.push(disclosed.issuerSignedItem)
+        issuerNamespaces.set(disclosed.namespace, items)
+      }
     }
 
     // 18013-5 7.2.5: a reader must not request more than two age attestations, as together they
@@ -530,7 +637,7 @@ export class DeviceResponse extends CborStructure<DeviceResponseEncodedStructure
     const ageOverLimitViolations = findAgeOverLimitViolations(disclosedElementIdentifiers)
     if (ageOverLimitViolations.length > 0) {
       throw new AgeOverLimitExceededError(
-        `Doc request would be answered with ${describeAgeOverLimitViolations(ageOverLimitViolations)}, but at most two age_over_NN elements may be disclosed per namespace. Select at most two of them`
+        `Doc request would be answered with ${describeAgeOverLimitViolations(ageOverLimitViolations)}, but at most two age_over_NN elements may be disclosed per namespace. Select at most two of them${options.alternatives && Object.keys(options.alternatives).length > 0 ? ', or choose other alternative sets' : ''}`
       )
     }
 
@@ -567,11 +674,103 @@ export class DeviceResponse extends CborStructure<DeviceResponseEncodedStructure
   }
 
   /**
+   * Throw an `UnsatisfiedDeviceRequestError` when the documents do not answer the device request the
+   * way its request information asks (ISO/IEC TS 23220-4 7.2.1.3): a document of an issuer its doc
+   * request does not name, more than one document for a doc request that requires a unique document
+   * set, or, when the device request carries use cases, a mandatory use case, or every use case, left
+   * without a document set whose doc requests all have a document.
+   *
+   * Only which doc requests get a document is checked, not which elements are disclosed, so the
+   * holder can still leave elements out. A doc request counts as having a document when a document
+   * of its docType is sent, as one document can answer several doc requests of the same docType. A
+   * response without any document is not checked, as that is how a holder declines a request it
+   * cannot or does not want to satisfy (18013-5 second edition 10.2.1).
+   *
+   * A device request without use cases does not say whether it asks for all its doc requests or for
+   * any one of them: ISO/IEC TS 23220-4 7.2.1.3.2 reads it as all of them, but the iOS DC API presents
+   * it as alternatives, so readers use it that way (see `treatAmbiguousMultipleDocRequestsAsAlternatives`).
+   * Which doc requests get a document is then not checked.
+   */
+  private static checkRequestInfo(deviceRequest: DeviceRequest, documents: Array<DeviceResponseDocumentOptions>) {
+    const documentsPerDocRequest = new Map<number, number>()
+    const docTypes = new Set<string>()
+
+    for (const [documentIndex, document] of documents.entries()) {
+      const { docRequestIndex } = document
+      const { requestInfo } = DeviceResponse.findDocRequest(deviceRequest, docRequestIndex).itemsRequest
+      documentsPerDocRequest.set(docRequestIndex, (documentsPerDocRequest.get(docRequestIndex) ?? 0) + 1)
+      docTypes.add(document.issuerSigned.issuerAuth.mobileSecurityObject.docType)
+
+      const issuer = matchIssuer(
+        requestInfo?.issuerIdentifiers,
+        issuerAuthCertificateChain(document.issuerSigned),
+        'x5chain of the IssuerAuth'
+      )
+      if (issuer && !issuer.success) {
+        throw new UnsatisfiedDeviceRequestError(
+          `Document ${documentIndex} answers doc request ${docRequestIndex}, but comes from an issuer it does not accept: ${issuer.reason}`
+        )
+      }
+
+      if (requestInfo?.uniqueDocSetRequired && documentsPerDocRequest.get(docRequestIndex) === 2) {
+        throw new UnsatisfiedDeviceRequestError(
+          `More than one document answers doc request ${docRequestIndex}, but it requires a unique document set`
+        )
+      }
+    }
+
+    const useCases = deviceRequest.deviceRequestInfo?.useCases
+    if (!useCases || documents.length === 0) return
+
+    const hasDocument = (docRequestIndex: number) =>
+      documentsPerDocRequest.has(docRequestIndex) ||
+      docTypes.has(DeviceResponse.findDocRequest(deviceRequest, docRequestIndex).itemsRequest.docType)
+    const isSatisfied = (documentSets: Array<Array<number>>) => documentSets.some((set) => set.every(hasDocument))
+
+    for (const [useCaseIndex, useCase] of useCases.entries()) {
+      if (useCase.mandatory && !isSatisfied(useCase.documentSets)) {
+        throw new UnsatisfiedDeviceRequestError(
+          `Use case ${useCaseIndex} is mandatory, but none of its document sets has a document for each of its doc requests`
+        )
+      }
+    }
+    if (!useCases.some((useCase) => isSatisfied(useCase.documentSets))) {
+      throw new UnsatisfiedDeviceRequestError(
+        'None of the use cases has a document set with a document for each of its doc requests'
+      )
+    }
+  }
+
+  /**
+   * Throw an `UnsatisfiedDeviceRequestError` when the response is larger than the smallest
+   * `maximumResponseSize` of the doc requests, the size in bytes of the unencrypted device response
+   * the reader can accept (ISO/IEC TS 23220-4 7.2.1.3.2).
+   */
+  private static checkResponseSize(deviceRequest: DeviceRequest, deviceResponse: DeviceResponse) {
+    const limits = deviceRequest.docRequests.flatMap((docRequest, docRequestIndex) => {
+      const maximumResponseSize = docRequest.itemsRequest.requestInfo?.maximumResponseSize
+      return maximumResponseSize === undefined ? [] : [{ docRequestIndex, maximumResponseSize }]
+    })
+    if (limits.length === 0) return
+
+    const limit = limits.reduce((smallest, current) =>
+      current.maximumResponseSize < smallest.maximumResponseSize ? current : smallest
+    )
+    const size = deviceResponse.encode().length
+    if (size > limit.maximumResponseSize) {
+      throw new UnsatisfiedDeviceRequestError(
+        `The device response is ${size} bytes, but doc request ${limit.docRequestIndex} accepts at most ${limit.maximumResponseSize}. Leave out elements or documents`
+      )
+    }
+  }
+
+  /**
    * Create a device response for a device request.
    *
    * Every document brings its own device key and, optionally, its own device namespaces, and names
-   * the doc request it answers through `docRequestIndex`, so a request may also be answered
-   * partially.
+   * the doc request it answers through `docRequestIndex`. Elements and doc requests may be left out,
+   * as long as the response still answers the request the way its request information asks: see
+   * `Holder.createDeviceResponseForDeviceRequest` for what is refused.
    */
   public static async createWithDeviceRequest(
     options: {
@@ -581,6 +780,8 @@ export class DeviceResponse extends CborStructure<DeviceResponseEncodedStructure
     },
     ctx: Pick<MdocContext, 'crypto' | 'cose'>
   ) {
+    DeviceResponse.checkRequestInfo(options.deviceRequest, options.documents)
+
     const documents = await Promise.all(
       options.documents.map((document) =>
         DeviceResponse.createDocument(
@@ -590,6 +791,7 @@ export class DeviceResponse extends CborStructure<DeviceResponseEncodedStructure
             sessionTranscript: options.sessionTranscript,
             issuerSigned: document.issuerSigned,
             elements: document.elements,
+            alternatives: document.alternatives,
             deviceNamespaces: document.deviceNamespaces,
             signature: document.signature,
             mac: document.mac,
@@ -599,7 +801,9 @@ export class DeviceResponse extends CborStructure<DeviceResponseEncodedStructure
       )
     )
 
-    return DeviceResponse.fromDocuments(documents)
+    const deviceResponse = DeviceResponse.fromDocuments(documents)
+    DeviceResponse.checkResponseSize(options.deviceRequest, deviceResponse)
+    return deviceResponse
   }
 
   public static createSimple(options: DeviceResponseOptions): DeviceResponse {
