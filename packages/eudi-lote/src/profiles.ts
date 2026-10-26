@@ -141,7 +141,7 @@ type TrustedEntitiesListRefinementOptions = {
 const trustedEntitiesListRefinement =
   ({ allowedServiceTypeIdentifiers, informationUriPrefix }: TrustedEntitiesListRefinementOptions) =>
   ({ LoTE }: LoTEDocument, ctx: z.RefinementCtx<LoTEDocument>) => {
-    LoTE.TrustedEntitiesList.forEach((entity, index) => {
+    LoTE.TrustedEntitiesList?.forEach((entity, index) => {
       const trustedEntityPath = ['LoTE', 'TrustedEntitiesList', index.toString()]
 
       if (informationUriPrefix) {

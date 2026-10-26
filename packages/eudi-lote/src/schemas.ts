@@ -30,9 +30,9 @@ export const LocalizedURISchema = z.object({
 export const PostalAddressSchema = z.object({
   lang: z.string().min(1),
   StreetAddress: z.string(),
-  Locality: z.string(),
+  Locality: z.string().optional(),
   StateOrProvince: z.string().optional(),
-  PostalCode: z.string(),
+  PostalCode: z.string().optional(),
   Country: z.string().length(2),
 })
 
@@ -91,7 +91,7 @@ export const ServiceDigitalIdentitySchema = z
 // ============================================================================
 
 export const ServiceSupplyPointSchema = z.object({
-  ServiceType: z.string(),
+  ServiceType: z.string().optional(),
   uriValue: z.url(),
 })
 
@@ -144,7 +144,8 @@ export const TrustedEntitySchema = z.object({
 
 export const PolicyOrLegalNoticeSchema = z.object({
   LoTEPolicy: LocalizedURISchema.optional(),
-  LoTELegalNotice: LocalizedStringSchema.optional(),
+  // The JSON schema of TS 119 602 types LoTELegalNotice as a plain string, the XML schema as a multilingual string
+  LoTELegalNotice: z.union([z.string(), LocalizedStringSchema]).optional(),
 })
 
 export const LoTEQualifierSchema = z.object({
@@ -187,7 +188,7 @@ export const ListAndSchemeInformationSchema = z.object({
 
 export const LoTESchema = z.object({
   ListAndSchemeInformation: ListAndSchemeInformationSchema,
-  TrustedEntitiesList: z.array(TrustedEntitySchema),
+  TrustedEntitiesList: z.array(TrustedEntitySchema).optional(),
 })
 
 export const LoTEDocumentSchema = z.object({

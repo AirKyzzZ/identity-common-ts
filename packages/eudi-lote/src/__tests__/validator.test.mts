@@ -3,7 +3,13 @@ import { describe, expect, it } from 'vitest'
 import { assertValidLoTE, validateLoTE } from '../index'
 import type { LoTEDocument } from '../types'
 import { LoTEProfile, validateLoTEProfile } from '../validator'
-import { EUPIDProvidersJWT, WalletProvidersJWT, WRPACProvidersJWT } from './fixtures.mjs'
+import {
+  EUPIDProvidersJWT,
+  LP26PIDProvidersEmptyJWT,
+  LP26WRPRCProvidersEmptyJWT,
+  WalletProvidersJWT,
+  WRPACProvidersJWT,
+} from './fixtures.mjs'
 
 describe('LoTE Validator', () => {
   const createMinimalValidLoTE = (): LoTEDocument => ({
@@ -426,6 +432,110 @@ describe('LoTE Validator', () => {
     })
   })
 
+  describe('TS 119 602 v1.1.1 JSON schema', () => {
+    const createTrustedEntity = (
+      postalAddress: Record<string, string>,
+      supplyPoints: Record<string, string>[]
+    ): Record<string, unknown> => ({
+      TrustedEntityInformation: {
+        TEName: [{ lang: 'en', value: 'Test Entity' }],
+        TEAddress: {
+          TEPostalAddress: [postalAddress],
+          TEElectronicAddress: [{ lang: 'en', uriValue: 'mailto:test@example.com' }],
+        },
+      },
+      TrustedEntityServices: [
+        {
+          ServiceInformation: {
+            ServiceName: [{ lang: 'en', value: 'Test Service' }],
+            ServiceDigitalIdentity: { X509SKIs: ['dGVzdA=='] },
+            ServiceSupplyPoints: supplyPoints,
+          },
+        },
+      ],
+    })
+
+    const withEntity = (entity: Record<string, unknown>) => {
+      const lote = createMinimalValidLoTE()
+      return { LoTE: { ...lote.LoTE, TrustedEntitiesList: [entity] } }
+    }
+
+    const fullAddress = { lang: 'en', StreetAddress: '123 St', Locality: 'City', PostalCode: '12345', Country: 'DE' }
+
+    it('should accept a list without TrustedEntitiesList', () => {
+      const { LoTE } = createMinimalValidLoTE()
+      const { TrustedEntitiesList: _, ...withoutEntities } = LoTE
+
+      expect(validateLoTE({ LoTE: withoutEntities })).toEqual({ valid: true, errors: [] })
+    })
+
+    it('should accept a service supply point without ServiceType', () => {
+      const lote = withEntity(createTrustedEntity(fullAddress, [{ uriValue: 'https://issuer.example.com/' }]))
+
+      expect(validateLoTE(lote)).toEqual({ valid: true, errors: [] })
+    })
+
+    it('should still require uriValue on a service supply point', () => {
+      const lote = withEntity(createTrustedEntity(fullAddress, [{ ServiceType: 'https://example.com/type' }]))
+      const result = validateLoTE(lote)
+
+      expect(result.valid).toBe(false)
+      expect(result.errors.map((e) => e.path)).toEqual([
+        'LoTE.TrustedEntitiesList.0.TrustedEntityServices.0.ServiceInformation.ServiceSupplyPoints.0.uriValue',
+      ])
+    })
+
+    it('should accept a postal address without Locality and PostalCode', () => {
+      const lote = withEntity(
+        createTrustedEntity({ lang: 'en', StreetAddress: '123 St', Country: 'DE' }, [
+          { uriValue: 'https://issuer.example.com/' },
+        ])
+      )
+
+      expect(validateLoTE(lote)).toEqual({ valid: true, errors: [] })
+    })
+
+    it('should still require StreetAddress and Country on a postal address', () => {
+      const lote = withEntity(
+        createTrustedEntity({ lang: 'en', Locality: 'City', PostalCode: '12345' }, [
+          { uriValue: 'https://issuer.example.com/' },
+        ])
+      )
+      const result = validateLoTE(lote)
+
+      expect(result.valid).toBe(false)
+      expect(result.errors.map((e) => e.path)).toEqual([
+        'LoTE.TrustedEntitiesList.0.TrustedEntityInformation.TEAddress.TEPostalAddress.0.StreetAddress',
+        'LoTE.TrustedEntitiesList.0.TrustedEntityInformation.TEAddress.TEPostalAddress.0.Country',
+      ])
+    })
+
+    it('should accept LoTELegalNotice as a plain string or a localized string', () => {
+      const lote = createMinimalValidLoTE()
+      lote.LoTE.ListAndSchemeInformation.PolicyOrLegalNotice = [
+        { LoTELegalNotice: 'Legal notice' },
+        { LoTELegalNotice: { lang: 'en', value: 'Legal notice' } },
+      ]
+
+      expect(validateLoTE(lote)).toEqual({ valid: true, errors: [] })
+    })
+
+    it('should reject an empty LoTELegalNotice object', () => {
+      const lote = createMinimalValidLoTE()
+      const result = validateLoTE({
+        LoTE: {
+          ...lote.LoTE,
+          ListAndSchemeInformation: {
+            ...lote.LoTE.ListAndSchemeInformation,
+            PolicyOrLegalNotice: [{ LoTELegalNotice: {} }],
+          },
+        },
+      })
+
+      expect(result.valid).toBe(false)
+    })
+  })
+
   describe('assertValidLoTE', () => {
     it('should not throw for valid LoTE document', () => {
       const lote = createMinimalValidLoTE()
@@ -467,6 +577,22 @@ describe('LoTE Validator', () => {
       const result = validateLoTEProfile(lote, LoTEProfile.EUWRPACProvidersList)
 
       expect(result.valid).toBe(true)
+    })
+
+    it('should validate an EC list without trusted entities against EUPIDProvidersList profile', () => {
+      const { payload: lote } = decodeJwt<any, LoTEDocument>(LP26PIDProvidersEmptyJWT)
+
+      expect(lote.LoTE.TrustedEntitiesList).toBeUndefined()
+      expect(validateLoTE(lote)).toEqual({ valid: true, errors: [] })
+      expect(validateLoTEProfile(lote, LoTEProfile.EUPIDProvidersList)).toEqual({ valid: true, errors: [] })
+    })
+
+    it('should validate an EC list with a plain string legal notice against EUWRPRCProvidersList profile', () => {
+      const { payload: lote } = decodeJwt<any, LoTEDocument>(LP26WRPRCProvidersEmptyJWT)
+
+      expect(lote.LoTE.ListAndSchemeInformation.PolicyOrLegalNotice).toEqual([{ LoTELegalNotice: 'Legal notice' }])
+      expect(validateLoTE(lote)).toEqual({ valid: true, errors: [] })
+      expect(validateLoTEProfile(lote, LoTEProfile.EUWRPRCProvidersList)).toEqual({ valid: true, errors: [] })
     })
 
     it('short-circuit errors when validating against wrong profile', () => {

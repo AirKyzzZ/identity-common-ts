@@ -176,7 +176,7 @@ export function addTrustedEntity(lote: LoTEDocument, entity: TrustedEntity): LoT
   return {
     LoTE: {
       ...lote.LoTE,
-      TrustedEntitiesList: [...lote.LoTE.TrustedEntitiesList, entity],
+      TrustedEntitiesList: [...(lote.LoTE.TrustedEntitiesList ?? []), entity],
     },
   }
 }
@@ -188,7 +188,7 @@ export function removeTrustedEntity(lote: LoTEDocument, entityName: string): LoT
   return {
     LoTE: {
       ...lote.LoTE,
-      TrustedEntitiesList: lote.LoTE.TrustedEntitiesList.filter(
+      TrustedEntitiesList: lote.LoTE.TrustedEntitiesList?.filter(
         (e) => !e.TrustedEntityInformation.TEName.some((n) => n.value === entityName)
       ),
     },
