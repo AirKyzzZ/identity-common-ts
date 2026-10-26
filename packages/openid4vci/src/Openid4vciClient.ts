@@ -64,7 +64,8 @@ export interface Openid4vciClientOptions {
    * Callbacks required for the openid4vc client. The `verifyJwt` callback is only
    * needed for verifying signed credential issuer metadata.
    */
-  callbacks: Omit<CallbackContext, 'verifyJwt' | 'encryptJwe'> & Partial<Pick<CallbackContext, 'verifyJwt'>>
+  callbacks: Omit<CallbackContext, 'verifyJwt' | 'encryptJwe'> &
+    Partial<Pick<CallbackContext, 'verifyJwt' | 'encryptJwe'>>
 }
 
 export class Openid4vciClient {
@@ -621,6 +622,7 @@ export class Openid4vciClient {
     accessToken,
     dpop,
     credentialResponseEncryption,
+    credentialRequestEncryption,
   }: Pick<
     RetrieveCredentialsWithFormatOptions,
     | 'accessToken'
@@ -630,6 +632,7 @@ export class Openid4vciClient {
     | 'proofs'
     | 'dpop'
     | 'credentialResponseEncryption'
+    | 'credentialRequestEncryption'
   > & { credentialConfigurationId: string }) {
     let credentialResponse: RetrieveCredentialsResponseNotOk | RetrieveCredentialsResponseOk
 
@@ -647,6 +650,7 @@ export class Openid4vciClient {
         callbacks: this.options.callbacks,
         dpop,
         credentialResponseEncryption,
+        credentialRequestEncryption,
       })
     } else {
       const formatPayload = getCredentialRequestFormatPayloadForCredentialConfigurationId({
@@ -664,6 +668,7 @@ export class Openid4vciClient {
         callbacks: this.options.callbacks,
         dpop,
         credentialResponseEncryption,
+        credentialRequestEncryption,
       })
     }
 
@@ -691,6 +696,7 @@ export class Openid4vciClient {
       | 'dpop'
       | 'additionalRequestPayload'
       | 'credentialResponseEncryption'
+      | 'credentialRequestEncryption'
     >
   ): Promise<RetrieveDeferredCredentialsResponseOk> {
     const credentialResponse = await retrieveDeferredCredentials({
