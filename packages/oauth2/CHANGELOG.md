@@ -1,5 +1,14 @@
 # @openid4vc/oauth2
 
+## 0.9.0
+
+### Patch Changes
+
+- 34bd5c9: Requests made with `createZodFetcher` now send the expected content types as the `Accept` header, unless the request already sets one. The first content type is preferred, and later ones get decreasing `q` values. Before, the expected content types were only checked against the response `Content-Type`.
+- Updated dependencies [bf9b7c8]
+- Updated dependencies [34bd5c9]
+  - @openid4vc/utils@0.9.0
+
 ## 0.8.2
 
 ### Patch Changes
