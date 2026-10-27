@@ -4,7 +4,11 @@ import { isMediaType } from '@owf/identity-common'
 import type { IssuerMetadataResult } from '../metadata/fetch-issuer-metadata'
 import { Openid4vciVersion } from '../version'
 import { type CredentialRequestBodyOptions, decryptCredentialRequest } from './decrypt-credential-request'
-import { type ParseCredentialRequestReturn, parseCredentialRequestPayload } from './parse-credential-request-payload'
+import {
+  type ParseCredentialRequestPayloadOptions,
+  type ParseCredentialRequestReturn,
+  parseCredentialRequestPayload,
+} from './parse-credential-request-payload'
 import {
   type ParseDeferredCredentialRequestReturn,
   parseDeferredCredentialRequestPayload,
@@ -49,7 +53,7 @@ function validatePlaintextCredentialRequestEncryption(options: {
   }
 }
 
-export function parseRequestPayload<TOptions, TResult>(
+function parseRequestPayload<TOptions, TResult>(
   parse: (options: TOptions) => TResult,
   options: TOptions,
   internalMessage: string
@@ -70,6 +74,12 @@ export function parseRequestPayload<TOptions, TResult>(
       }
     )
   }
+}
+
+export function parseDecryptedCredentialRequest(
+  options: ParseCredentialRequestPayloadOptions
+): ParseCredentialRequestReturn {
+  return parseRequestPayload(parseCredentialRequestPayload, options, 'Error parsing credential request')
 }
 
 function invalidCredentialRequestContentType(): Oauth2ServerErrorResponseError {
@@ -95,22 +105,17 @@ export async function parseCredentialRequest(
       issuerMetadata: options.issuerMetadata,
       callbacks: options.callbacks,
     })
-    return parseRequestPayload(
-      parseCredentialRequestPayload,
-      { issuerMetadata: options.issuerMetadata, credentialRequest },
-      'Error verifying credential request proof jwt'
-    )
+    return parseDecryptedCredentialRequest({ issuerMetadata: options.issuerMetadata, credentialRequest })
   }
 
   if (isMediaType(options.contentType, ContentType.Json)) {
     if (options.issuerMetadata.credentialIssuer.credential_request_encryption?.encryption_required) {
       throw credentialRequestEncryptionRequired()
     }
-    const parsedCredentialRequest = parseRequestPayload(
-      parseCredentialRequestPayload,
-      { issuerMetadata: options.issuerMetadata, credentialRequest: options.body },
-      'Error verifying credential request proof jwt'
-    )
+    const parsedCredentialRequest = parseDecryptedCredentialRequest({
+      issuerMetadata: options.issuerMetadata,
+      credentialRequest: options.body,
+    })
     validatePlaintextCredentialRequestEncryption({
       issuerMetadata: options.issuerMetadata,
       hasCredentialResponseEncryption: parsedCredentialRequest.credentialResponseEncryption !== undefined,

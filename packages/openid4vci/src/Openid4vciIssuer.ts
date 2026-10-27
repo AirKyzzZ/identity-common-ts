@@ -17,13 +17,12 @@ import {
 import type { CredentialRequestBodyOptions } from './credential-request/decrypt-credential-request'
 import {
   parseCredentialRequest,
+  parseDecryptedCredentialRequest,
   parseDeferredCredentialRequest,
-  parseRequestPayload,
 } from './credential-request/parse-credential-request'
-import {
-  type ParseCredentialRequestPayloadOptions,
-  type ParseCredentialRequestReturn,
-  parseCredentialRequestPayload,
+import type {
+  ParseCredentialRequestPayloadOptions,
+  ParseCredentialRequestReturn,
 } from './credential-request/parse-credential-request-payload'
 import type { ParseDeferredCredentialRequestReturn } from './credential-request/parse-deferred-credential-request-payload'
 import { Openid4vciError } from './error/Openid4vciError'
@@ -270,7 +269,7 @@ export class Openid4vciIssuer {
    * @throws Oauth2ServerErrorResponseError - when validation of the credential request fails
    */
   public parseCredentialRequestPayload(options: ParseCredentialRequestPayloadOptions): ParseCredentialRequestReturn {
-    return parseRequestPayload(parseCredentialRequestPayload, options, 'Error verifying credential request proof jwt')
+    return parseDecryptedCredentialRequest(options)
   }
 
   /**
