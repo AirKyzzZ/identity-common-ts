@@ -49,7 +49,7 @@ function validatePlaintextCredentialRequestEncryption(options: {
   }
 }
 
-function parseRequestPayload<TOptions, TResult>(
+export function parseRequestPayload<TOptions, TResult>(
   parse: (options: TOptions) => TResult,
   options: TOptions,
   internalMessage: string

@@ -15,8 +15,16 @@ import {
   createDeferredCredentialResponse,
 } from './credential-request/credential-response'
 import type { CredentialRequestBodyOptions } from './credential-request/decrypt-credential-request'
-import { parseCredentialRequest, parseDeferredCredentialRequest } from './credential-request/parse-credential-request'
-import type { ParseCredentialRequestReturn } from './credential-request/parse-credential-request-payload'
+import {
+  parseCredentialRequest,
+  parseDeferredCredentialRequest,
+  parseRequestPayload,
+} from './credential-request/parse-credential-request'
+import {
+  type ParseCredentialRequestPayloadOptions,
+  type ParseCredentialRequestReturn,
+  parseCredentialRequestPayload,
+} from './credential-request/parse-credential-request-payload'
 import type { ParseDeferredCredentialRequestReturn } from './credential-request/parse-deferred-credential-request-payload'
 import { Openid4vciError } from './error/Openid4vciError'
 import {
@@ -254,6 +262,15 @@ export class Openid4vciIssuer {
       issuerMetadata: options.issuerMetadata,
       callbacks: this.options.callbacks,
     })
+  }
+
+  /**
+   * Parses and validates a Credential Request that was already decrypted, or received in plaintext,
+   * without applying the transport encryption rules of {@link parseCredentialRequest}.
+   * @throws Oauth2ServerErrorResponseError - when validation of the credential request fails
+   */
+  public parseCredentialRequestPayload(options: ParseCredentialRequestPayloadOptions): ParseCredentialRequestReturn {
+    return parseRequestPayload(parseCredentialRequestPayload, options, 'Error verifying credential request proof jwt')
   }
 
   /**

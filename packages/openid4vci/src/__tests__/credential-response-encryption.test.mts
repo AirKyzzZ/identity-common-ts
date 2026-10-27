@@ -1023,3 +1023,29 @@ test('does not allow explicitly selecting a signing-only request encryption key'
     })
   ).rejects.toThrow("Credential request encryption key with kid 'signing-key' is not intended for encryption.")
 })
+
+describe('Credential Request Payload', () => {
+  const credentialRequest = {
+    credential_configuration_id: 'pidSdJwt',
+    credential_response_encryption: credentialResponseEncryption,
+  }
+
+  test('parses a decrypted request with credential_response_encryption that is rejected as plaintext', async () => {
+    await expect(
+      issuer.parseCredentialRequest({ issuerMetadata, credentialRequest, contentType: ContentType.Json })
+    ).rejects.toMatchObject({ errorResponse: { error: 'invalid_encryption_parameters' } })
+
+    expect(issuer.parseCredentialRequestPayload({ issuerMetadata, credentialRequest })).toMatchObject({
+      credentialRequest,
+      credentialResponseEncryption,
+    })
+  })
+
+  test('rejects an invalid credential request', () => {
+    expect(() =>
+      issuer.parseCredentialRequestPayload({ issuerMetadata, credentialRequest: { proofs: { jwt: 'a' } } })
+    ).toThrow(
+      expect.objectContaining({ errorResponse: expect.objectContaining({ error: 'invalid_credential_request' }) })
+    )
+  })
+})
